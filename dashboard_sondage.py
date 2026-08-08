@@ -4,6 +4,7 @@ Lit les donnees depuis un CSV (Google Sheet publie en CSV, ou fichier local pour
 """
 
 import re
+import unicodedata
 from collections import Counter
 
 import gradio as gr
@@ -57,7 +58,17 @@ STOPWORDS_FR = {
     "son", "sa", "ses", "leur", "leurs", "mon", "ma", "mes", "votre", "vos",
     "ne", "se", "si", "ou", "mais", "car", "donc", "par", "d", "l", "s",
     "n", "c", "j", "y", "vraiment", "meme", "aussi", "peu", "bien",
+    "faut", "faire", "faites", "fait", "chose", "tout", "toute", "toutes",
+    "tous", "cela", "ainsi", "dont", "etes", "etais", "sera", "seront",
 }
+
+
+def enlever_accents(mot):
+    """Normalise un mot en retirant ses accents, pour comparer 'tres' et 'très' correctement."""
+    return "".join(c for c in unicodedata.normalize("NFD", mot) if unicodedata.category(c) != "Mn")
+
+
+STOPWORDS_FR_SANS_ACCENTS = {enlever_accents(m) for m in STOPWORDS_FR}
 
 # Palette de couleurs coherente
 COULEUR_LIGNE = "#0891b2"
@@ -432,7 +443,7 @@ def generer_carte_mots_cles(df):
         return None
     texte_complet = " ".join(textes).lower()
     mots = re.findall(r"[a-zàâäéèêëïîôöùûüç]+", texte_complet)
-    mots_filtres = [m for m in mots if m not in STOPWORDS_FR and len(m) > 2]
+    mots_filtres = [m for m in mots if enlever_accents(m) not in STOPWORDS_FR_SANS_ACCENTS and len(m) > 2]
     if not mots_filtres:
         return None
     frequences = Counter(mots_filtres)
