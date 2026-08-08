@@ -1,0 +1,13 @@
+[project]
+name = "dashboard-immigration-ontario"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "gradio>=6.22.0",
+    "matplotlib>=3.11.1",
+    "pandas>=3.0.5",
+    "plotly>=6.9.0",
+    "wordcloud>=1.9.6",
+]
