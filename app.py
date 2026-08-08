@@ -10,6 +10,15 @@ import gradio as gr
 import pandas as pd
 import plotly.express as px
 from wordcloud import WordCloud
+import spaces
+
+@spaces.GPU(duration=1)
+def _verification_gpu_hf():
+    # Fonction technique requise par Hugging Face pour les Spaces ZeroGPU.
+    # Cette app n'a pas besoin de GPU, cette fonction n'est jamais appelee.
+    pass
+
+
 
 # =============================================================
 # CONFIG
