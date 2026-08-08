@@ -3,6 +3,7 @@ Dashboard en temps reel pour le sondage sur l'immigration francophone en Ontario
 Lit les donnees depuis un CSV (Google Sheet publie en CSV, ou fichier local pour test).
 """
 
+import os
 import re
 import unicodedata
 from collections import Counter
@@ -11,12 +12,21 @@ import gradio as gr
 import pandas as pd
 import plotly.express as px
 from wordcloud import WordCloud
+import spaces
+
+@spaces.GPU(duration=1)
+def _verification_gpu_hf():
+    # Fonction technique requise par Hugging Face pour les Spaces ZeroGPU.
+    # Cette app n'a pas besoin de GPU, cette fonction n'est jamais appelee.
+    pass
+
+
 
 # =============================================================
 # CONFIG
 # =============================================================
 
-SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/1vLkVKIM_hsRLuFFoN8oje6rqtS4xWa_vMzPtmg7K9LA/export?format=csv&gid=1945629438"
+SHEET_CSV_URL = os.environ.get("SHEET_CSV_URL", "https://docs.google.com/spreadsheets/d/1vLkVKIM_hsRLuFFoN8oje6rqtS4xWa_vMzPtmg7K9LA/export?format=csv&gid=1945629438")
 
 COL_TIMESTAMP = "Horodateur"
 COL_ANNEES_CANADA = "Depuis combien d'années êtes-vous au Canada ?"
