@@ -292,12 +292,38 @@ STATUTS_EN_EMPLOI = {
 # KPI (cartes en haut du dashboard)
 # =============================================================
 
-def carte_kpi(valeur, label, couleur):
+def intervalle_confiance_wilson(succes, n, z=1.96):
+    """Intervalle de confiance de Wilson pour une proportion (95% par defaut).
+    Plus fiable qu'une approximation normale simple quand n est petit,
+    ce qui est notre cas avec un echantillon de sondage de quelques dizaines de reponses."""
+    if n == 0:
+        return (0.0, 0.0)
+    p = succes / n
+    denom = 1 + z**2 / n
+    centre = p + z**2 / (2 * n)
+    marge = z * ((p * (1 - p) / n + z**2 / (4 * n**2)) ** 0.5)
+    borne_inf = max(0.0, (centre - marge) / denom)
+    borne_sup = min(1.0, (centre + marge) / denom)
+    return borne_inf, borne_sup
+
+
+def formater_ic(succes, n):
+    """Formate un pourcentage avec son intervalle de confiance a 95%, ex: '78% (IC95: 62-88%)'."""
+    if n == 0:
+        return "n/a"
+    pct = succes / n * 100
+    bas, haut = intervalle_confiance_wilson(succes, n)
+    return f"{pct:.0f}% (IC95: {bas*100:.0f}-{haut*100:.0f}%)"
+
+
+def carte_kpi(valeur, label, couleur, ic=None):
+    ic_html = f'<div style="font-size:11px; color:#9ca3af; margin-top:2px;">{ic}</div>' if ic else ""
     return f"""
     <div style="flex:1; min-width:150px; background:white; border-radius:10px;
                 border-left:5px solid {couleur}; padding:16px 18px; box-shadow:0 1px 3px rgba(0,0,0,0.08);">
         <div style="font-size:28px; font-weight:700; color:#111827; line-height:1.1;">{valeur}</div>
         <div style="font-size:13px; color:#6b7280; margin-top:4px;">{label}</div>
+        {ic_html}
     </div>
     """
 
@@ -311,26 +337,34 @@ def generer_kpis(df):
         delais_connus = delais_connus[delais_connus != "Toujours en recherche"]
         if not delais_connus.empty:
             mode_delai = delais_connus.value_counts().idxmax()
-            pct = (delais_connus == mode_delai).mean() * 100
-            cartes.append(carte_kpi(mode_delai, f"Delai le plus frequent ({pct:.0f}%)", COULEUR_LIGNE))
+            n_mode = int((delais_connus == mode_delai).sum())
+            n_delais = len(delais_connus)
+            ic = formater_ic(n_mode, n_delais)
+            cartes.append(carte_kpi(mode_delai, "Delai le plus frequent", COULEUR_LIGNE, ic=ic))
 
     if COL_STATUT_TRAVAIL in df.columns:
         statuts = df[COL_STATUT_TRAVAIL].dropna()
         if not statuts.empty:
-            pct_emploi = statuts.isin(STATUTS_EN_EMPLOI).mean() * 100
-            cartes.append(carte_kpi(f"{pct_emploi:.0f}%", "Actuellement en emploi", COULEUR_OK))
+            n_emploi = int(statuts.isin(STATUTS_EN_EMPLOI).sum())
+            ic = formater_ic(n_emploi, len(statuts))
+            pct_emploi = n_emploi / len(statuts) * 100
+            cartes.append(carte_kpi(f"{pct_emploi:.0f}%", "Actuellement en emploi", COULEUR_OK, ic=ic))
 
     if COL_FORMATION_CA in df.columns:
         f = df[COL_FORMATION_CA].dropna()
         if not f.empty:
-            pct_formation = (f == "Oui").mean() * 100
-            cartes.append(carte_kpi(f"{pct_formation:.0f}%", "Ont suivi une formation canadienne", COULEUR_ATTENTION))
+            n_oui = int((f == "Oui").sum())
+            ic = formater_ic(n_oui, len(f))
+            pct_formation = n_oui / len(f) * 100
+            cartes.append(carte_kpi(f"{pct_formation:.0f}%", "Ont suivi une formation canadienne", COULEUR_ATTENTION, ic=ic))
 
     if COL_SERVICES in df.columns:
         s = df[COL_SERVICES].dropna()
         if not s.empty:
-            pct_services = (s == "Oui").mean() * 100
-            cartes.append(carte_kpi(f"{pct_services:.0f}%", "Ont utilise des services d'etablissement", COULEUR_ATTENTION))
+            n_oui = int((s == "Oui").sum())
+            ic = formater_ic(n_oui, len(s))
+            pct_services = n_oui / len(s) * 100
+            cartes.append(carte_kpi(f"{pct_services:.0f}%", "Ont utilise des services d'etablissement", COULEUR_ATTENTION, ic=ic))
 
     col_majeur = COL_OBSTACLES.get("Obstacle majeur")
     if col_majeur in df.columns:
@@ -340,7 +374,8 @@ def generer_kpis(df):
                 compteur[item] += 1
         if compteur:
             top_obstacle, top_n = compteur.most_common(1)[0]
-            cartes.append(carte_kpi(top_obstacle, f"1er obstacle majeur cite ({top_n}x)", COULEUR_ALERTE))
+            ic = formater_ic(top_n, n) if n else None
+            cartes.append(carte_kpi(top_obstacle, "1er obstacle majeur cite", COULEUR_ALERTE, ic=ic))
 
     return f'<div style="display:flex; gap:14px; flex-wrap:wrap;">{"".join(cartes)}</div>'
 
@@ -368,7 +403,11 @@ def taux_rapide(df, col_groupe):
 
 def generer_insights(df):
     n = len(df)
-    lignes = [f"_Echantillon actuel : {n} reponses au total._", ""]
+    lignes = [
+        f"_Echantillon actuel : {n} reponses au total. Les pourcentages ci-dessous sont accompagnes "
+        f"de leur intervalle de confiance a 95% (IC95) : plus il est large, moins l'estimation est fiable._",
+        "",
+    ]
     au_moins_un_insight = False
 
     # Ville de residence : Ottawa vs reste
@@ -379,16 +418,13 @@ def generer_insights(df):
         pct_o, n_o = taux.get("Ottawa", (None, 0))
         pct_a, n_a = taux.get("Ailleurs en Ontario", (None, 0))
         if n_o >= SEUIL_MIN_GROUPE and n_a >= SEUIL_MIN_GROUPE:
-            lignes.append(
-                f"- **Ottawa** : {pct_o*100:.0f}% (n={n_o}) ont trouve un emploi en 6 mois ou moins, "
-                f"contre **{pct_a*100:.0f}%** (n={n_a}) ailleurs en Ontario."
-            )
+            ic_o = formater_ic(round(pct_o * n_o), n_o)
+            ic_a = formater_ic(round(pct_a * n_a), n_a)
+            lignes.append(f"- **Ottawa** : {ic_o} ont trouve un emploi en 6 mois ou moins, contre **{ic_a}** ailleurs en Ontario.")
             au_moins_un_insight = True
         elif n_o >= SEUIL_MIN_GROUPE:
-            lignes.append(
-                f"- **Ottawa** : {pct_o*100:.0f}% (n={n_o}) ont trouve un emploi en 6 mois ou moins "
-                f"(pas assez de reponses hors Ottawa pour comparer, n={n_a})."
-            )
+            ic_o = formater_ic(round(pct_o * n_o), n_o)
+            lignes.append(f"- **Ottawa** : {ic_o} ont trouve un emploi en 6 mois ou moins (pas assez de reponses hors Ottawa pour comparer, n={n_a}).")
             au_moins_un_insight = True
 
     # Formation canadienne
@@ -396,10 +432,9 @@ def generer_insights(df):
     pct_oui, n_oui = taux.get("Oui", (None, 0))
     pct_non, n_non = taux.get("Non", (None, 0))
     if n_oui >= SEUIL_MIN_GROUPE and n_non >= SEUIL_MIN_GROUPE:
-        lignes.append(
-            f"- **Formation canadienne suivie** : {pct_oui*100:.0f}% (n={n_oui}) trouvent rapidement un emploi, "
-            f"contre {pct_non*100:.0f}% (n={n_non}) sans formation."
-        )
+        ic_oui = formater_ic(round(pct_oui * n_oui), n_oui)
+        ic_non = formater_ic(round(pct_non * n_non), n_non)
+        lignes.append(f"- **Formation canadienne suivie** : {ic_oui} trouvent rapidement un emploi, contre {ic_non} sans formation.")
         au_moins_un_insight = True
 
     # Services d'etablissement
@@ -407,10 +442,9 @@ def generer_insights(df):
     pct_oui, n_oui = taux.get("Oui", (None, 0))
     pct_non, n_non = taux.get("Non", (None, 0))
     if n_oui >= SEUIL_MIN_GROUPE and n_non >= SEUIL_MIN_GROUPE:
-        lignes.append(
-            f"- **Recours a des services d'etablissement** : {pct_oui*100:.0f}% (n={n_oui}) trouvent rapidement un emploi, "
-            f"contre {pct_non*100:.0f}% (n={n_non}) sans ce recours."
-        )
+        ic_oui = formater_ic(round(pct_oui * n_oui), n_oui)
+        ic_non = formater_ic(round(pct_non * n_non), n_non)
+        lignes.append(f"- **Recours a des services d'etablissement** : {ic_oui} trouvent rapidement un emploi, contre {ic_non} sans ce recours.")
         au_moins_un_insight = True
 
     # Obstacle le plus cite comme majeur
@@ -422,7 +456,8 @@ def generer_insights(df):
                 compteur[item] += 1
         if compteur:
             top_obstacle, top_n = compteur.most_common(1)[0]
-            lignes.append(f"- **Obstacle le plus cite comme majeur** : {top_obstacle} ({top_n} repondants).")
+            ic_obstacle = formater_ic(top_n, n) if n else "n/a"
+            lignes.append(f"- **Obstacle le plus cite comme majeur** : {top_obstacle}, cite par {ic_obstacle} des repondants.")
             au_moins_un_insight = True
 
     if not au_moins_un_insight:
