@@ -287,7 +287,23 @@ STATUTS_EN_EMPLOI = {
     "Travail qualifié dans mon domaine",
     "Travail qualifié autre domaine",
     "Travail non qualifié",
+    "Auto-entrepreneur",
 }
+
+
+def fig_statut_travail(df):
+    """Distribution du statut sur le marche du travail (emploi dans le domaine ou non)."""
+    if COL_STATUT_TRAVAIL not in df.columns:
+        return styliser_titre(px.bar(template=TEMPLATE), "Statut sur le marche du travail")
+    c = df[COL_STATUT_TRAVAIL].dropna().value_counts().sort_values(ascending=False).reset_index()
+    c.columns = ["statut", "nombre"]
+    fig = px.bar(
+        c, x="statut", y="nombre", template=TEMPLATE,
+        color="nombre", color_continuous_scale=["#d1fae5", "#047857"],
+    )
+    fig.update_layout(coloraxis_showscale=False)
+    fig.update_xaxes(title=None, tickfont=dict(size=10))
+    return styliser_titre(fig, "Statut sur le marche du travail")
 
 # =============================================================
 # KPI (cartes en haut du dashboard)
@@ -350,6 +366,11 @@ def generer_kpis(df):
             ic = formater_ic(n_emploi, len(statuts))
             pct_emploi = n_emploi / len(statuts) * 100
             cartes.append(carte_kpi(f"{pct_emploi:.0f}%", "Actuellement en emploi", COULEUR_OK, ic=ic))
+
+            n_domaine = int((statuts == "Travail qualifié dans mon domaine").sum())
+            ic_domaine = formater_ic(n_domaine, len(statuts))
+            pct_domaine = n_domaine / len(statuts) * 100
+            cartes.append(carte_kpi(f"{pct_domaine:.0f}%", "Emploi dans leur domaine de competence", COULEUR_LIGNE, ic=ic_domaine))
 
     if COL_FORMATION_CA in df.columns:
         f = df[COL_FORMATION_CA].dropna()
@@ -684,6 +705,31 @@ def generer_carte_mots_cles(df):
 # Assemblage du dashboard
 # =============================================================
 
+def fig_heatmap_generique(df, col_lignes, col_colonnes, titre, ordre_colonnes=None):
+    """Carte de chaleur generique entre deux variables categorielles quelconques."""
+    if col_lignes not in df.columns or col_colonnes not in df.columns:
+        return styliser_titre(px.imshow([[0]], template=TEMPLATE), f"Donnees indisponibles: {titre}")
+    sub = df[[col_lignes, col_colonnes]].dropna()
+    if sub.empty:
+        return styliser_titre(px.imshow([[0]], template=TEMPLATE), f"Pas encore de donnees: {titre}")
+
+    ct = pd.crosstab(sub[col_lignes], sub[col_colonnes])
+    if ordre_colonnes:
+        colonnes_presentes = [c for c in ordre_colonnes if c in ct.columns]
+        ct = ct[colonnes_presentes]
+    ct = ct.loc[ct.sum(axis=1).sort_values(ascending=False).index]
+
+    fig = px.imshow(
+        ct.values, x=ct.columns, y=ct.index,
+        color_continuous_scale=GRADIENT_HEATMAP,
+        text_auto=True, aspect="auto", template=TEMPLATE,
+    )
+    fig.update_layout(coloraxis_showscale=False)
+    fig.update_xaxes(title=None, tickfont=dict(size=11))
+    fig.update_yaxes(title=None, tickfont=dict(size=10))
+    return styliser_titre(fig, titre)
+
+
 def construire_dashboard(regions=None, ages=None, genre="Tous", annees=None):
     df = charger_donnees()
     n_avant_filtre = len(df)
@@ -704,9 +750,14 @@ def construire_dashboard(regions=None, ages=None, genre="Tous", annees=None):
     g4 = fig_delai_heatmap(df, COL_DOMAINE, "Delai par secteur")
     g5 = fig_delai_bar(df, COL_NIVEAU_ANGLAIS, "Delai par niveau d'anglais")
     g6 = fig_delai_bar(df, COL_SERVICES, "Delai par recours aux services")
+    g7 = fig_statut_travail(df)
+    g8 = fig_heatmap_generique(
+        df, COL_STATUT_TRAVAIL, COL_FORMATION_CA,
+        "Statut d'emploi par formation canadienne",
+    )
     img_wordcloud = generer_carte_mots_cles(df)
 
-    return kpis, insights, g1, g2, g3, g4, g5, g6, img_wordcloud
+    return kpis, insights, g1, g2, g3, g4, g5, g6, g7, g8, img_wordcloud
 
 
 # =============================================================
@@ -740,12 +791,15 @@ with gr.Blocks(title="Dashboard - Sondage immigration francophone Ontario") as d
             with gr.Row():
                 g5 = gr.Plot()
                 g6 = gr.Plot()
+            with gr.Row():
+                g7 = gr.Plot()
+                g8 = gr.Plot()
 
             gr.Markdown("## Carte des mots-cles - conseils aux futurs arrivants")
             img_nuage = gr.Image(label="Mots les plus frequents", show_label=False)
 
             entrees = [filtre_region, filtre_age, filtre_genre, filtre_annees]
-            sorties = [kpi_html, insights_txt, g1, g2, g3, g4, g5, g6, img_nuage]
+            sorties = [kpi_html, insights_txt, g1, g2, g3, g4, g5, g6, g7, g8, img_nuage]
 
             demo.load(construire_dashboard, inputs=entrees, outputs=sorties)
             bouton_refresh.click(construire_dashboard, inputs=entrees, outputs=sorties)
