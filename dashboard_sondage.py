@@ -236,6 +236,10 @@ def styliser_titre(fig, titre, taille=13):
         title=dict(text=titre, font=dict(size=taille), x=0.02, xanchor="left"),
         margin=dict(t=42, l=10, r=10, b=10),
     )
+    # Desactive le zoom a la molette sur les graphiques, pour que la molette
+    # continue de faire defiler la page normalement au lieu d'etre captee par Plotly.
+    fig.update_xaxes(fixedrange=True)
+    fig.update_yaxes(fixedrange=True)
     return fig
 
 
@@ -299,7 +303,7 @@ def fig_statut_travail(df):
     c.columns = ["statut", "nombre"]
     fig = px.bar(
         c, x="statut", y="nombre", template=TEMPLATE,
-        color="nombre", color_continuous_scale=["#d1fae5", "#047857"],
+        color="nombre", color_continuous_scale=["#bfdbfe", "#1d4ed8"],
     )
     fig.update_layout(coloraxis_showscale=False)
     fig.update_xaxes(title=None, tickfont=dict(size=10))
