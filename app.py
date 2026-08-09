@@ -149,7 +149,7 @@ CHOIX_AGE = obtenir_choix(_df_init, COL_AGE, ORDRE_AGE)
 CHOIX_ANNEES = obtenir_choix(_df_init, COL_ANNEES_CANADA, ORDRE_ANNEES)
 
 
-def appliquer_filtres(df, regions, ages, genre, annees):
+def appliquer_filtres(df, regions, ages, genre, annees, domaine_travail=None):
     if regions:
         df = df[df[COL_REGION_ORIGINE].isin(regions)]
     if ages:
@@ -158,6 +158,9 @@ def appliquer_filtres(df, regions, ages, genre, annees):
         df = df[df[COL_GENRE] == genre]
     if annees:
         df = df[df[COL_ANNEES_CANADA].isin(annees)]
+    if domaine_travail and domaine_travail != "Tous":
+        d = creer_domaine_binaire(df)
+        df = d[d["_domaine_bin"] == domaine_travail].drop(columns=["_domaine_bin"])
     return df
 
 
@@ -496,10 +499,64 @@ def generer_insights(df):
             lignes.append(f"- **Obstacle le plus cite comme majeur** : {top_obstacle}, cite par {ic_obstacle} des repondants.")
             au_moins_un_insight = True
 
+    # --- Emploi dans le domaine : quels facteurs sont associes ? ---
+    taux = taux_domaine(df, COL_FORMATION_CA)
+    pct_oui, n_oui = taux.get("Oui", (None, 0))
+    pct_non, n_non = taux.get("Non", (None, 0))
+    if n_oui >= SEUIL_MIN_GROUPE and n_non >= SEUIL_MIN_GROUPE:
+        ic_oui = formater_ic(round(pct_oui * n_oui), n_oui)
+        ic_non = formater_ic(round(pct_non * n_non), n_non)
+        lignes.append(f"- **Formation canadienne et emploi dans le domaine** : {ic_oui} ont un emploi dans leur domaine chez ceux qui ont suivi une formation, contre {ic_non} chez ceux qui n'en ont pas suivi.")
+        au_moins_un_insight = True
+
+    taux = taux_domaine(df, COL_SERVICES)
+    pct_oui, n_oui = taux.get("Oui", (None, 0))
+    pct_non, n_non = taux.get("Non", (None, 0))
+    if n_oui >= SEUIL_MIN_GROUPE and n_non >= SEUIL_MIN_GROUPE:
+        ic_oui = formater_ic(round(pct_oui * n_oui), n_oui)
+        ic_non = formater_ic(round(pct_non * n_non), n_non)
+        lignes.append(f"- **Services d'etablissement et emploi dans le domaine** : {ic_oui} ont un emploi dans leur domaine chez ceux qui ont eu recours a des services, contre {ic_non} chez ceux qui n'y ont pas eu recours.")
+        au_moins_un_insight = True
+
+    taux = taux_domaine(df, COL_NIVEAU_ANGLAIS)
+    niveaux_suffisants = {k: v for k, v in taux.items() if v[1] >= SEUIL_MIN_GROUPE}
+    if len(niveaux_suffisants) >= 2:
+        details = ", ".join(f"{niveau} : {formater_ic(round(p*n), n)}" for niveau, (p, n) in niveaux_suffisants.items())
+        lignes.append(f"- **Niveau d'anglais et emploi dans le domaine** : {details}.")
+        au_moins_un_insight = True
+
     if not au_moins_un_insight:
         lignes.append(f"_Pas encore assez de donnees pour comparer des groupes de maniere fiable (minimum {SEUIL_MIN_GROUPE} reponses par groupe requis)._")
 
     return "\n".join(lignes)
+
+
+def creer_domaine_binaire(df):
+    """Classe chaque reponse en 'Dans le domaine' vs 'Hors domaine', selon le statut de travail.
+    Les personnes en etudes/formation sont exclues (question non applicable)."""
+    d = df.copy()
+    if COL_STATUT_TRAVAIL not in d.columns:
+        return d
+    def classer(v):
+        if pd.isna(v) or v == "En etudes ou en formation":
+            return None
+        return "Dans le domaine" if v == "Travail qualifié dans mon domaine" else "Hors domaine"
+    d["_domaine_bin"] = d[COL_STATUT_TRAVAIL].apply(classer)
+    return d
+
+
+def taux_domaine(df, col_groupe):
+    """Retourne, pour chaque valeur de col_groupe, le (%, n) ayant un emploi dans leur domaine."""
+    if col_groupe not in df.columns or COL_STATUT_TRAVAIL not in df.columns:
+        return {}
+    d = creer_domaine_binaire(df)
+    sub = d[[col_groupe, "_domaine_bin"]].dropna()
+    if sub.empty:
+        return {}
+    sub = sub.copy()
+    sub["dans_domaine"] = sub["_domaine_bin"] == "Dans le domaine"
+    grp = sub.groupby(col_groupe)["dans_domaine"].agg(["mean", "count"])
+    return {idx: (row["mean"], int(row["count"])) for idx, row in grp.iterrows()}
 
 
 # =============================================================
@@ -649,6 +706,73 @@ def bloc_mannwhitney(df, col_groupe, nom_variable):
 """
 
 
+def bloc_test_association(df, col_groupe, col_resultat, nom_variable, nom_resultat):
+    """Test d'association generique entre deux variables categorielles.
+    Utilise le test exact de Fisher pour un tableau 2x2, et le test du Chi2
+    (avec verification des effectifs attendus) pour un tableau plus grand."""
+    if col_groupe not in df.columns or col_resultat not in df.columns:
+        return None
+    sub = df[[col_groupe, col_resultat]].dropna()
+    if sub.empty:
+        return None
+
+    table = pd.crosstab(sub[col_groupe], sub[col_resultat])
+    if table.shape[0] < 2 or table.shape[1] < 2:
+        return None
+
+    effectifs = sub[col_groupe].value_counts()
+    if (effectifs < SEUIL_TEST_GROUPE).any():
+        return None
+
+    n_total = int(table.values.sum())
+
+    if table.shape == (2, 2):
+        nom_test = "Test exact de Fisher"
+        _, p = spstats.fisher_exact(table.values)
+        chi2, _, _, _ = spstats.chi2_contingency(table.values, correction=False)
+        explication = (
+            "Ce test verifie si deux variables categorielles sont liees, en calculant la "
+            "probabilite exacte d'observer ce tableau (ou plus extreme) si elles etaient "
+            "independantes. Bien adapte aux petits echantillons."
+        )
+    else:
+        chi2, p, dof, expected = spstats.chi2_contingency(table.values)
+        cellules_fiables = (expected >= 5).sum() / expected.size >= 0.8 and (expected >= 1).all()
+        if not cellules_fiables:
+            return None
+        nom_test = "Test du Chi2"
+        explication = (
+            "Ce test verifie si deux variables categorielles a plusieurs niveaux sont liees, "
+            "en comparant les effectifs observes aux effectifs attendus si elles etaient "
+            "independantes l'une de l'autre."
+        )
+
+    v_cramer = (chi2 / (n_total * (min(table.shape) - 1))) ** 0.5
+    signif = "statistiquement significatif" if p < 0.05 else "non significatif"
+    if v_cramer < 0.1:
+        force = "tres faible"
+    elif v_cramer < 0.3:
+        force = "faible a modere"
+    elif v_cramer < 0.5:
+        force = "modere a fort"
+    else:
+        force = "fort"
+
+    tableau_txt = table.to_string()
+
+    return f"""### {nom_test} — {nom_variable} vs {nom_resultat}
+
+*{explication}*
+
+```
+{tableau_txt}
+```
+
+- p-value : {p:.3f} → resultat **{signif}** au seuil de 5%
+- V de Cramer (force du lien) : {v_cramer:.2f} → lien **{force}**
+"""
+
+
 def construire_page_stats():
     df = charger_donnees()
     n = len(df)
@@ -670,6 +794,13 @@ def construire_page_stats():
         )
         blocs.append(bloc_fisher(d_ville, "_groupe_ville", "Ville de residence (Ottawa vs ailleurs)"))
         blocs.append(bloc_mannwhitney(d_ville, "_groupe_ville", "Ville de residence (Ottawa vs ailleurs)"))
+
+    # --- Qu'est-ce qui est associe a un emploi DANS le domaine (pas juste un emploi) ? ---
+    d_domaine = creer_domaine_binaire(df)
+    blocs.append(bloc_test_association(d_domaine, COL_FORMATION_CA, "_domaine_bin", "Formation canadienne", "Emploi dans le domaine"))
+    blocs.append(bloc_test_association(d_domaine, COL_NIVEAU_ANGLAIS, "_domaine_bin", "Niveau d'anglais", "Emploi dans le domaine"))
+    blocs.append(bloc_test_association(d_domaine, COL_SERVICES, "_domaine_bin", "Recours aux services d'etablissement", "Emploi dans le domaine"))
+    blocs.append(bloc_mannwhitney(d_domaine, "_domaine_bin", "Emploi dans le domaine (delai d'obtention)"))
 
     blocs = [b for b in blocs if b]
 
@@ -744,10 +875,10 @@ def fig_heatmap_generique(df, col_lignes, col_colonnes, titre, ordre_colonnes=No
     return styliser_titre(fig, titre)
 
 
-def construire_dashboard(regions=None, ages=None, genre="Tous", annees=None):
+def construire_dashboard(regions=None, ages=None, genre="Tous", annees=None, domaine_travail="Tous"):
     df = charger_donnees()
     n_avant_filtre = len(df)
-    df = appliquer_filtres(df, regions, ages, genre, annees)
+    df = appliquer_filtres(df, regions, ages, genre, annees, domaine_travail)
     n_total = len(df)
 
     kpis = generer_kpis(df)
@@ -781,53 +912,64 @@ def construire_dashboard(regions=None, ages=None, genre="Tous", annees=None):
 with gr.Blocks(title="Dashboard - Sondage immigration francophone Ontario") as demo:
     gr.Markdown("# Immigration francophone en Ontario")
 
-    with gr.Tabs():
-        with gr.Tab("Dashboard"):
-            with gr.Row():
-                filtre_region = gr.Dropdown(choices=CHOIX_REGION, multiselect=True, label="Region d'origine", value=[])
-                filtre_age = gr.Dropdown(choices=CHOIX_AGE, multiselect=True, label="Tranche d'age", value=[])
-                filtre_genre = gr.Dropdown(choices=["Tous", "Femme", "Homme"], value="Tous", label="Genre")
-                filtre_annees = gr.Dropdown(choices=CHOIX_ANNEES, multiselect=True, label="Annees au Canada", value=[])
-
+    with gr.Row():
+        with gr.Column(scale=1, min_width=220):
+            gr.Markdown("### Filtres")
+            filtre_region = gr.Dropdown(choices=CHOIX_REGION, multiselect=True, label="Region d'origine", value=[])
+            filtre_age = gr.Dropdown(choices=CHOIX_AGE, multiselect=True, label="Tranche d'age", value=[])
+            filtre_genre = gr.Dropdown(choices=["Tous", "Femme", "Homme"], value="Tous", label="Genre")
+            filtre_annees = gr.Dropdown(choices=CHOIX_ANNEES, multiselect=True, label="Annees au Canada", value=[])
+            filtre_domaine = gr.Dropdown(
+                choices=["Tous", "Dans le domaine", "Hors domaine"], value="Tous",
+                label="Emploi dans le domaine ?",
+            )
             bouton_refresh = gr.Button("Rafraichir les donnees")
 
-            kpi_html = gr.HTML()
+        with gr.Column(scale=4):
+            with gr.Tabs():
+                with gr.Tab("Vue d'ensemble"):
+                    kpi_html = gr.HTML()
 
-            gr.Markdown("## Insights cles")
-            insights_txt = gr.Markdown()
+                    gr.Markdown("## Insights cles")
+                    insights_txt = gr.Markdown()
 
-            with gr.Row():
-                g1 = gr.Plot()
-                g2 = gr.Plot()
-            with gr.Row():
-                g3 = gr.Plot()
-                g4 = gr.Plot()
-            with gr.Row():
-                g5 = gr.Plot()
-                g6 = gr.Plot()
-            with gr.Row():
-                g7 = gr.Plot()
-                g8 = gr.Plot()
+                    with gr.Row():
+                        g1 = gr.Plot()
+                        g2 = gr.Plot()
+                    with gr.Row():
+                        g7 = gr.Plot()
 
-            gr.Markdown("## Carte des mots-cles - conseils aux futurs arrivants")
-            img_nuage = gr.Image(label="Mots les plus frequents", show_label=False)
+                    gr.Markdown("## Carte des mots-cles - conseils aux futurs arrivants")
+                    img_nuage = gr.Image(label="Mots les plus frequents", show_label=False)
 
-            entrees = [filtre_region, filtre_age, filtre_genre, filtre_annees]
-            sorties = [kpi_html, insights_txt, g1, g2, g3, g4, g5, g6, g7, g8, img_nuage]
+                with gr.Tab("Croisements"):
+                    gr.Markdown("## Croisements avec le delai d'obtention d'un emploi, et avec la correspondance au domaine")
+                    with gr.Row():
+                        g3 = gr.Plot()
+                        g4 = gr.Plot()
+                    with gr.Row():
+                        g5 = gr.Plot()
+                        g6 = gr.Plot()
+                    with gr.Row():
+                        g8 = gr.Plot()
 
-            demo.load(construire_dashboard, inputs=entrees, outputs=sorties)
-            bouton_refresh.click(construire_dashboard, inputs=entrees, outputs=sorties)
-            filtre_region.change(construire_dashboard, inputs=entrees, outputs=sorties)
-            filtre_age.change(construire_dashboard, inputs=entrees, outputs=sorties)
-            filtre_genre.change(construire_dashboard, inputs=entrees, outputs=sorties)
-            filtre_annees.change(construire_dashboard, inputs=entrees, outputs=sorties)
+                with gr.Tab("Tests statistiques"):
+                    bouton_stats = gr.Button("Lancer / rafraichir les tests")
+                    stats_md = gr.Markdown()
 
-        with gr.Tab("Tests statistiques"):
-            bouton_stats = gr.Button("Lancer / rafraichir les tests")
-            stats_md = gr.Markdown()
+                    demo.load(construire_page_stats, outputs=stats_md)
+                    bouton_stats.click(construire_page_stats, outputs=stats_md)
 
-            demo.load(construire_page_stats, outputs=stats_md)
-            bouton_stats.click(construire_page_stats, outputs=stats_md)
+    entrees = [filtre_region, filtre_age, filtre_genre, filtre_annees, filtre_domaine]
+    sorties = [kpi_html, insights_txt, g1, g2, g3, g4, g5, g6, g7, g8, img_nuage]
+
+    demo.load(construire_dashboard, inputs=entrees, outputs=sorties)
+    bouton_refresh.click(construire_dashboard, inputs=entrees, outputs=sorties)
+    filtre_region.change(construire_dashboard, inputs=entrees, outputs=sorties)
+    filtre_age.change(construire_dashboard, inputs=entrees, outputs=sorties)
+    filtre_genre.change(construire_dashboard, inputs=entrees, outputs=sorties)
+    filtre_annees.change(construire_dashboard, inputs=entrees, outputs=sorties)
+    filtre_domaine.change(construire_dashboard, inputs=entrees, outputs=sorties)
 
 if __name__ == "__main__":
     demo.launch()
