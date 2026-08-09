@@ -11,6 +11,7 @@ import gradio as gr
 import pandas as pd
 import plotly.express as px
 from wordcloud import WordCloud
+from scipy import stats as spstats
 
 # =============================================================
 # CONFIG
@@ -467,6 +468,196 @@ def generer_insights(df):
 
 
 # =============================================================
+# Tests statistiques (page separee)
+# =============================================================
+
+DELAI_RANG = {val: i for i, val in enumerate(DELAI_ORDER)}
+ANGLAIS_RANG = {"Intermédiaire": 1, "Bilingue / courant": 2, "Avancé": 3}
+SEUIL_TEST_GROUPE = 5
+SEUIL_TEST_CORRELATION = 15
+
+
+def preparer_delai_ordinal(df):
+    d = df.copy()
+    d["_delai_rang"] = d[COL_DELAI_EMPLOI].map(DELAI_RANG)
+    return d
+
+
+def preparer_delai_binaire(df):
+    d = df.copy()
+    def classer(v):
+        if v in DELAI_RAPIDE:
+            return "Rapide (<=6 mois)"
+        if v in {"6 mois à 1 an", "Plus d'un an", "Toujours en recherche"}:
+            return "Lent (>6 mois)"
+        return None
+    d["_delai_bin"] = d[COL_DELAI_EMPLOI].apply(classer)
+    return d
+
+
+def bloc_spearman_anglais_delai(df):
+    """Correlation entre deux variables ordonnees : niveau d'anglais et delai d'emploi."""
+    if COL_NIVEAU_ANGLAIS not in df.columns or COL_DELAI_EMPLOI not in df.columns:
+        return None
+    d = preparer_delai_ordinal(df)
+    d["_anglais_rang"] = d[COL_NIVEAU_ANGLAIS].map(ANGLAIS_RANG)
+    sub = d[["_anglais_rang", "_delai_rang"]].dropna()
+    n = len(sub)
+    if n < SEUIL_TEST_CORRELATION:
+        return None
+
+    rho, p = spstats.spearmanr(sub["_anglais_rang"], sub["_delai_rang"])
+    signif = "statistiquement significatif" if p < 0.05 else "non significatif"
+    if abs(rho) < 0.1:
+        sens = "aucune tendance claire ne se degage"
+    elif rho < 0:
+        sens = "plus le niveau d'anglais est eleve, plus le delai tend a etre court"
+    else:
+        sens = "plus le niveau d'anglais est eleve, plus le delai tend a etre long (contre-intuitif, a verifier avec plus de donnees)"
+
+    return f"""### Correlation de Spearman — niveau d'anglais et delai d'emploi
+
+*Ce test mesure si deux variables ordonnees (ici le niveau d'anglais et le delai, du plus rapide au plus lent) evoluent ensemble, sans supposer une relation lineaire. Le coefficient rho va de -1 (relation inverse parfaite) a +1 (relation directe parfaite). Contrairement a une correlation de Pearson, il ne suppose pas que les donnees sont continues.*
+
+- Echantillon : n={n}
+- Coefficient de Spearman : rho = {rho:.2f}
+- p-value : {p:.3f} → resultat **{signif}** au seuil de 5%
+- Interpretation : {sens}
+"""
+
+
+def bloc_fisher(df, col_groupe, nom_variable):
+    """Test exact de Fisher pour un tableau 2x2 (variable binaire vs delai regroupe rapide/lent)."""
+    if col_groupe not in df.columns or COL_DELAI_EMPLOI not in df.columns:
+        return None
+    d = preparer_delai_binaire(df)
+    sub = d[[col_groupe, "_delai_bin"]].dropna()
+    if sub.empty:
+        return None
+
+    table = pd.crosstab(sub[col_groupe], sub["_delai_bin"])
+    if table.shape != (2, 2):
+        return None  # le test de Fisher classique s'applique uniquement a un tableau 2x2
+
+    effectifs = sub[col_groupe].value_counts()
+    if (effectifs < SEUIL_TEST_GROUPE).any():
+        return None
+
+    oddsratio, p = spstats.fisher_exact(table.values)
+    chi2, _, _, _ = spstats.chi2_contingency(table.values, correction=False)
+    n_total = int(table.values.sum())
+    v_cramer = (chi2 / n_total) ** 0.5
+
+    signif = "statistiquement significatif" if p < 0.05 else "non significatif"
+    if v_cramer < 0.1:
+        force = "tres faible"
+    elif v_cramer < 0.3:
+        force = "faible a modere"
+    elif v_cramer < 0.5:
+        force = "modere a fort"
+    else:
+        force = "fort"
+
+    tableau_txt = table.to_string()
+
+    return f"""### Test exact de Fisher — {nom_variable}
+
+*Ce test verifie si deux variables categorielles sont liees, en calculant la probabilite exacte d'observer ce tableau (ou plus extreme) si elles etaient independantes l'une de l'autre. Il est plus fiable que le test du Chi2 classique quand l'echantillon est petit.*
+
+```
+{tableau_txt}
+```
+
+- p-value (Fisher) : {p:.3f} → resultat **{signif}** au seuil de 5%
+- V de Cramer (force du lien, 0 = aucun lien, 1 = lien parfait) : {v_cramer:.2f} → lien **{force}**
+"""
+
+
+def bloc_mannwhitney(df, col_groupe, nom_variable):
+    """Compare la distribution complete des delais (5 niveaux) entre 2 groupes, sans supposer une loi normale."""
+    if col_groupe not in df.columns or COL_DELAI_EMPLOI not in df.columns:
+        return None
+    d = preparer_delai_ordinal(df)
+    sub = d[[col_groupe, "_delai_rang"]].dropna()
+    if sub.empty:
+        return None
+
+    groupes = sub[col_groupe].unique().tolist()
+    if len(groupes) != 2:
+        return None
+
+    effectifs = sub[col_groupe].value_counts()
+    if (effectifs < SEUIL_TEST_GROUPE).any():
+        return None
+
+    g1, g2 = groupes
+    x = sub.loc[sub[col_groupe] == g1, "_delai_rang"]
+    y = sub.loc[sub[col_groupe] == g2, "_delai_rang"]
+    stat, p = spstats.mannwhitneyu(x, y, alternative="two-sided")
+
+    def rang_vers_delai(valeur_mediane):
+        idx = int(round(valeur_mediane))
+        idx = min(max(idx, 0), len(DELAI_ORDER) - 1)
+        return DELAI_ORDER[idx]
+
+    signif = "statistiquement significatif" if p < 0.05 else "non significatif"
+    plus_rapide = g1 if x.median() < y.median() else (g2 if y.median() < x.median() else "aucun (egalite)")
+
+    return f"""### Test de Mann-Whitney — {nom_variable}
+
+*Ce test non parametrique compare la distribution des delais entre deux groupes sans supposer que les donnees suivent une loi normale — adapte a une variable ordonnee en 5 niveaux comme notre delai d'emploi.*
+
+- {g1} : n={len(x)}, delai median ≈ {rang_vers_delai(x.median())}
+- {g2} : n={len(y)}, delai median ≈ {rang_vers_delai(y.median())}
+- p-value : {p:.3f} → resultat **{signif}** au seuil de 5%
+- Groupe avec le delai median le plus court : **{plus_rapide}**
+"""
+
+
+def construire_page_stats():
+    df = charger_donnees()
+    n = len(df)
+
+    blocs = []
+
+    blocs.append(bloc_spearman_anglais_delai(df))
+
+    blocs.append(bloc_fisher(df, COL_FORMATION_CA, "Formation canadienne suivie"))
+    blocs.append(bloc_mannwhitney(df, COL_FORMATION_CA, "Formation canadienne suivie"))
+
+    blocs.append(bloc_fisher(df, COL_SERVICES, "Recours a des services d'etablissement"))
+    blocs.append(bloc_mannwhitney(df, COL_SERVICES, "Recours a des services d'etablissement"))
+
+    if COL_VILLE_RESIDENCE in df.columns:
+        d_ville = df.copy()
+        d_ville["_groupe_ville"] = d_ville[COL_VILLE_RESIDENCE].apply(
+            lambda v: "Ottawa" if v == "Ottawa" else "Ailleurs en Ontario"
+        )
+        blocs.append(bloc_fisher(d_ville, "_groupe_ville", "Ville de residence (Ottawa vs ailleurs)"))
+        blocs.append(bloc_mannwhitney(d_ville, "_groupe_ville", "Ville de residence (Ottawa vs ailleurs)"))
+
+    blocs = [b for b in blocs if b]
+
+    intro = f"""# Tests statistiques
+
+Echantillon actuel : **{n} reponses**.
+
+Cette page applique des tests formels aux croisements deja presentes dans le dashboard principal, pour vérifier lesquels sont statistiquement fiables plutot que de simples variations dues au hasard d'un petit echantillon. **Seuls les tests dont les conditions sont remplies (taille de groupe suffisante, structure de tableau adaptee) sont affiches ci-dessous** — les autres sont ecartes automatiquement plutot que d'afficher un resultat peu fiable.
+
+A retenir avec un echantillon de cette taille : l'absence de resultat "significatif" ne veut pas dire qu'il n'y a pas de difference reelle dans la population generale — seulement que cet echantillon est peut-etre trop petit pour la detecter avec certitude (ce qu'on appelle un manque de "puissance statistique").
+
+---
+
+"""
+    if not blocs:
+        corps = "_Aucun test ne remplit actuellement les conditions minimales de faisabilite (groupes trop petits, moins de {SEUIL_TEST_GROUPE} reponses). Reessayez avec un echantillon plus grand._"
+    else:
+        corps = "\n\n---\n\n".join(blocs)
+
+    return intro + corps
+
+
+# =============================================================
 # Carte de mots-cles
 # =============================================================
 
@@ -523,43 +714,52 @@ def construire_dashboard(regions=None, ages=None, genre="Tous", annees=None):
 # =============================================================
 
 with gr.Blocks(title="Dashboard - Sondage immigration francophone Ontario") as demo:
-    gr.Markdown("# Dashboard en temps reel - Immigration francophone en Ontario")
+    gr.Markdown("# Immigration francophone en Ontario")
 
-    with gr.Row():
-        filtre_region = gr.Dropdown(choices=CHOIX_REGION, multiselect=True, label="Region d'origine", value=[])
-        filtre_age = gr.Dropdown(choices=CHOIX_AGE, multiselect=True, label="Tranche d'age", value=[])
-        filtre_genre = gr.Dropdown(choices=["Tous", "Femme", "Homme"], value="Tous", label="Genre")
-        filtre_annees = gr.Dropdown(choices=CHOIX_ANNEES, multiselect=True, label="Annees au Canada", value=[])
+    with gr.Tabs():
+        with gr.Tab("Dashboard"):
+            with gr.Row():
+                filtre_region = gr.Dropdown(choices=CHOIX_REGION, multiselect=True, label="Region d'origine", value=[])
+                filtre_age = gr.Dropdown(choices=CHOIX_AGE, multiselect=True, label="Tranche d'age", value=[])
+                filtre_genre = gr.Dropdown(choices=["Tous", "Femme", "Homme"], value="Tous", label="Genre")
+                filtre_annees = gr.Dropdown(choices=CHOIX_ANNEES, multiselect=True, label="Annees au Canada", value=[])
 
-    bouton_refresh = gr.Button("Rafraichir les donnees")
+            bouton_refresh = gr.Button("Rafraichir les donnees")
 
-    kpi_html = gr.HTML()
+            kpi_html = gr.HTML()
 
-    gr.Markdown("## Insights cles")
-    insights_txt = gr.Markdown()
+            gr.Markdown("## Insights cles")
+            insights_txt = gr.Markdown()
 
-    with gr.Row():
-        g1 = gr.Plot()
-        g2 = gr.Plot()
-    with gr.Row():
-        g3 = gr.Plot()
-        g4 = gr.Plot()
-    with gr.Row():
-        g5 = gr.Plot()
-        g6 = gr.Plot()
+            with gr.Row():
+                g1 = gr.Plot()
+                g2 = gr.Plot()
+            with gr.Row():
+                g3 = gr.Plot()
+                g4 = gr.Plot()
+            with gr.Row():
+                g5 = gr.Plot()
+                g6 = gr.Plot()
 
-    gr.Markdown("## Carte des mots-cles - conseils aux futurs arrivants")
-    img_nuage = gr.Image(label="Mots les plus frequents", show_label=False)
+            gr.Markdown("## Carte des mots-cles - conseils aux futurs arrivants")
+            img_nuage = gr.Image(label="Mots les plus frequents", show_label=False)
 
-    entrees = [filtre_region, filtre_age, filtre_genre, filtre_annees]
-    sorties = [kpi_html, insights_txt, g1, g2, g3, g4, g5, g6, img_nuage]
+            entrees = [filtre_region, filtre_age, filtre_genre, filtre_annees]
+            sorties = [kpi_html, insights_txt, g1, g2, g3, g4, g5, g6, img_nuage]
 
-    demo.load(construire_dashboard, inputs=entrees, outputs=sorties)
-    bouton_refresh.click(construire_dashboard, inputs=entrees, outputs=sorties)
-    filtre_region.change(construire_dashboard, inputs=entrees, outputs=sorties)
-    filtre_age.change(construire_dashboard, inputs=entrees, outputs=sorties)
-    filtre_genre.change(construire_dashboard, inputs=entrees, outputs=sorties)
-    filtre_annees.change(construire_dashboard, inputs=entrees, outputs=sorties)
+            demo.load(construire_dashboard, inputs=entrees, outputs=sorties)
+            bouton_refresh.click(construire_dashboard, inputs=entrees, outputs=sorties)
+            filtre_region.change(construire_dashboard, inputs=entrees, outputs=sorties)
+            filtre_age.change(construire_dashboard, inputs=entrees, outputs=sorties)
+            filtre_genre.change(construire_dashboard, inputs=entrees, outputs=sorties)
+            filtre_annees.change(construire_dashboard, inputs=entrees, outputs=sorties)
+
+        with gr.Tab("Tests statistiques"):
+            bouton_stats = gr.Button("Lancer / rafraichir les tests")
+            stats_md = gr.Markdown()
+
+            demo.load(construire_page_stats, outputs=stats_md)
+            bouton_stats.click(construire_page_stats, outputs=stats_md)
 
 if __name__ == "__main__":
     demo.launch()

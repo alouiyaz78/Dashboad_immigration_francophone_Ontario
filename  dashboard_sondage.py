@@ -15,7 +15,7 @@ from wordcloud import WordCloud
 # CONFIG
 # =============================================================
 
-SHEET_CSV_URL = os.environ.get("SHEET_CSV_URL", "COLLE_TON_LIEN_ICI")
+SHEET_CSV_URL = os.environ.get("SHEET_CSV_URL", "https://docs.google.com/spreadsheets/d/1vLkVKIM_hsRLuFFoN8oje6rqtS4xWa_vMzPtmg7K9LA/edit?usp=sharing")
 
 COL_TIMESTAMP = "Horodateur"
 COL_ANNEES_CANADA = "Depuis combien d'années êtes-vous au Canada ?"
