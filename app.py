@@ -11,6 +11,7 @@ from collections import Counter
 import gradio as gr
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 from wordcloud import WordCloud
 import spaces
 
@@ -73,13 +74,27 @@ STOPWORDS_FR = {
     "tous", "cela", "ainsi", "dont", "etes", "etais", "sera", "seront",
 }
 
+# Mots propres au contexte du sondage (immigration/emploi) qui reviennent dans presque
+# toutes les reponses sans etre informatifs : ils reprennent le vocabulaire de la
+# question elle-meme plutot que d'apporter un signal distinctif.
+STOPWORDS_DOMAINE = {
+    "canada", "canadien", "canadienne", "canadiens", "canadiennes",
+    "travail", "travailler", "travaillez",
+    "emploi", "emplois",
+    "temps", "avant", "lieu",
+    "ontario",
+    "arrivee", "arrivant", "arrivants",
+    "conseil", "conseille", "conseillerais",
+    "personne", "personnes",
+}
+
 
 def enlever_accents(mot):
     """Normalise un mot en retirant ses accents, pour comparer 'tres' et 'très' correctement."""
     return "".join(c for c in unicodedata.normalize("NFD", mot) if unicodedata.category(c) != "Mn")
 
 
-STOPWORDS_FR_SANS_ACCENTS = {enlever_accents(m) for m in STOPWORDS_FR}
+STOPWORDS_FR_SANS_ACCENTS = {enlever_accents(m) for m in STOPWORDS_FR | STOPWORDS_DOMAINE}
 
 # Palette de couleurs coherente
 COULEUR_LIGNE = "#0891b2"
@@ -87,6 +102,11 @@ COULEUR_BARRE = "#2563eb"
 COULEUR_OK = "#22c55e"
 COULEUR_ATTENTION = "#f59e0b"
 COULEUR_ALERTE = "#ef4444"
+# Couleur neutre pour les graphiques descriptifs (region, statut) : la valeur est deja
+# encodee par la hauteur/position, une echelle de couleur en plus serait redondante.
+COULEUR_NEUTRE = "#94a3b8"
+# Vert profond inspire du drapeau franco-ontarien (accent secondaire, identite communautaire).
+COULEUR_VERT_FRANCO = "#1f4f3d"
 PALETTE_DELAI = {
     "1 à 3 mois": "#ffedd5",
     "3 à 6 mois": "#fdba74",
@@ -94,8 +114,16 @@ PALETTE_DELAI = {
     "Plus d'un an": "#ea580c",
     "Toujours en recherche": "#9a3412",
 }
-GRADIENT_HEATMAP = ["#fff7ed", "#9a3412"]
+GRADIENT_HEATMAP = ["#fff1f2", "#e11d48", "#7f1d1d"]  # blanc/rose pale -> rouge vif -> bordeaux
 TEMPLATE = "plotly_white"
+
+# En dessous de ce nombre de reponses, un groupe est trop petit pour etre compare de
+# maniere fiable : on le fusionne dans "Autres" (graphiques) ou on ne le compare pas
+# (insights/tests). Seuil unique reutilise partout dans le dashboard pour la coherence.
+SEUIL_MIN_GROUPE = 5
+# Sous ce nombre de reponses, un groupe reste affiche mais avec une opacite reduite,
+# pour signaler visuellement une fiabilite plus faible sans le masquer completement.
+SEUIL_OPACITE_REDUITE = SEUIL_MIN_GROUPE * 2
 
 # =============================================================
 # Chargement et nettoyage des donnees
@@ -168,35 +196,74 @@ def appliquer_filtres(df, regions, ages, genre, annees, domaine_travail=None):
 # Graphiques
 # =============================================================
 
+def fusionner_petits_groupes(serie, seuil=SEUIL_MIN_GROUPE):
+    """Fusionne les categories comptant moins de `seuil` occurrences dans 'Autres',
+    pour eviter des comparaisons peu fiables entre groupes de tailles tres differentes.
+    Le label reste simple ; l'effectif total du groupe fusionne apparait ensuite via
+    l'annotation "(n=X)" ajoutee par les graphiques appelants."""
+    effectifs = serie.value_counts()
+    petits = effectifs[effectifs < seuil].index.tolist()
+    if not petits:
+        return serie
+    return serie.apply(lambda v: "Autres" if v in petits else v)
+
+
 def fig_region(df):
     if COL_REGION_ORIGINE not in df.columns:
         return px.bar(title="Colonne region d'origine introuvable")
     c = df[COL_REGION_ORIGINE].dropna().value_counts().sort_values(ascending=False).reset_index()
     c.columns = ["region", "nombre"]
+    c["pct"] = c["nombre"] / c["nombre"].sum() * 100
     fig = px.bar(
         c, x="region", y="nombre", template=TEMPLATE,
         color="nombre", color_continuous_scale=["#bfdbfe", "#1d4ed8"],
+        custom_data=["pct"],
+    )
+    fig.update_traces(
+        texttemplate="%{customdata[0]:.0f}%", textposition="outside",
+        hovertemplate="%{x}<br>n=%{y} (%{customdata[0]:.0f}%)<extra></extra>",
     )
     fig.update_layout(coloraxis_showscale=False)
     return styliser_titre(fig, "Region d'origine")
 
 
 def fig_delai_bar(df, col_groupe, titre):
-    """Barres empilees pour les croisements simples (peu de categories)."""
+    """Barres empilees en % (100% stacked) pour les croisements simples (peu de categories).
+    Chaque groupe est normalise a 100% pour rester comparable meme si les groupes ont des
+    tailles tres differentes ; le nombre de reponses (n) apparait dans l'etiquette et dans
+    l'infobulle, et les groupes proches du seuil minimal sont affiches avec une opacite reduite."""
     if col_groupe not in df.columns or COL_DELAI_EMPLOI not in df.columns:
         return styliser_titre(px.bar(template=TEMPLATE), f"Donnees indisponibles: {titre}")
-    sub = df[[col_groupe, COL_DELAI_EMPLOI]].dropna()
+    sub = df[[col_groupe, COL_DELAI_EMPLOI]].dropna().copy()
     if sub.empty:
         return styliser_titre(px.bar(template=TEMPLATE), f"Pas encore de donnees: {titre}")
-    ct = sub.groupby([col_groupe, COL_DELAI_EMPLOI]).size().reset_index(name="nombre")
-    ordre_groupe = sub[col_groupe].value_counts().index.tolist()
-    fig = px.bar(
-        ct, x=col_groupe, y="nombre", color=COL_DELAI_EMPLOI,
-        category_orders={COL_DELAI_EMPLOI: DELAI_ORDER, col_groupe: ordre_groupe},
-        color_discrete_map=PALETTE_DELAI, barmode="stack", template=TEMPLATE,
+
+    sub[col_groupe] = fusionner_petits_groupes(sub[col_groupe])
+    effectifs = sub[col_groupe].value_counts()
+    ordre_groupe = effectifs.index.tolist()
+    etiquettes = [f"{g} (n={effectifs[g]})" for g in ordre_groupe]
+
+    ct = pd.crosstab(sub[col_groupe], sub[COL_DELAI_EMPLOI])
+    colonnes = [c for c in DELAI_ORDER if c in ct.columns]
+    ct = ct.reindex(index=ordre_groupe, columns=colonnes, fill_value=0)
+    ct_pct = ct.div(effectifs, axis=0) * 100
+
+    opacites = [0.55 if effectifs[g] < SEUIL_OPACITE_REDUITE else 1.0 for g in ordre_groupe]
+
+    fig = go.Figure()
+    for delai in colonnes:
+        fig.add_trace(go.Bar(
+            x=etiquettes, y=ct_pct[delai], name=delai,
+            marker=dict(color=PALETTE_DELAI.get(delai, COULEUR_NEUTRE), opacity=opacites),
+            customdata=ct[delai].values,
+            hovertemplate=f"%{{x}}<br>{delai} : %{{y:.0f}}% (n=%{{customdata}})<extra></extra>",
+        ))
+    fig.update_layout(
+        barmode="stack", template=TEMPLATE,
+        legend_title_text="Delai", legend_font_size=11,
+        xaxis=dict(title=None),
+        yaxis=dict(title="% des repondants", range=[0, 100], ticksuffix="%"),
     )
-    fig.update_layout(legend_title_text="Delai", legend_font_size=11)
-    fig.update_xaxes(title=None)
     return styliser_titre(fig, titre)
 
 
@@ -210,10 +277,11 @@ DELAI_GROUPE_MAP = {
 DELAI_GROUPE_ORDER = ["Rapide (≤6 mois)", "Moyen (6 mois-1 an)", "Lent (+1 an)"]
 
 
-def fig_delai_heatmap(df, col_groupe, titre, seuil_min_ligne=3):
-    """Carte de chaleur pour les croisements avec beaucoup de categories (ex: secteur d'activite).
-    Le delai est regroupe en 3 niveaux et les categories peu representees sont fusionnees
-    dans 'Autres', pour eviter une grille clairsemee pleine de 0 et de 1."""
+def fig_delai_heatmap(df, col_groupe, titre, seuil_min_ligne=SEUIL_MIN_GROUPE):
+    """Carte de chaleur en % par ligne pour les croisements avec beaucoup de categories
+    (ex: secteur d'activite). Le delai est regroupe en 3 niveaux, les categories peu
+    representees sont fusionnees dans 'Autres', et chaque ligne est normalisee en %
+    pour rester comparable malgre des tailles de groupe tres differentes."""
     if col_groupe not in df.columns or COL_DELAI_EMPLOI not in df.columns:
         return styliser_titre(px.imshow([[0]], template=TEMPLATE), f"Donnees indisponibles: {titre}")
     sub = df[[col_groupe, COL_DELAI_EMPLOI]].dropna().copy()
@@ -221,24 +289,27 @@ def fig_delai_heatmap(df, col_groupe, titre, seuil_min_ligne=3):
         return styliser_titre(px.imshow([[0]], template=TEMPLATE), f"Pas encore de donnees: {titre}")
 
     sub["delai_groupe"] = sub[COL_DELAI_EMPLOI].map(DELAI_GROUPE_MAP)
-
-    effectifs = sub[col_groupe].value_counts()
-    petits = effectifs[effectifs < seuil_min_ligne].index.tolist()
-    if petits:
-        libelle_autres = f"Autres (n<{seuil_min_ligne} chacun)"
-        sub[col_groupe] = sub[col_groupe].apply(lambda v: libelle_autres if v in petits else v)
+    sub[col_groupe] = fusionner_petits_groupes(sub[col_groupe], seuil_min_ligne)
 
     ct = pd.crosstab(sub[col_groupe], sub["delai_groupe"])
     colonnes_ordonnees = [c for c in DELAI_GROUPE_ORDER if c in ct.columns]
     ct = ct[colonnes_ordonnees]
-    ct = ct.loc[ct.sum(axis=1).sort_values(ascending=False).index]
+    effectifs = ct.sum(axis=1).sort_values(ascending=False)
+    ct = ct.loc[effectifs.index]
+    ct_pct = ct.div(effectifs, axis=0) * 100
+    etiquettes_lignes = [f"{idx} (n={effectifs[idx]})" for idx in ct.index]
 
     fig = px.imshow(
-        ct.values, x=ct.columns, y=ct.index,
-        color_continuous_scale=GRADIENT_HEATMAP,
-        text_auto=True, aspect="auto", template=TEMPLATE,
+        ct_pct.values, x=ct_pct.columns, y=etiquettes_lignes,
+        color_continuous_scale=GRADIENT_HEATMAP, zmin=0, zmax=100,
+        aspect="auto", template=TEMPLATE,
     )
-    fig.update_layout(coloraxis_showscale=False)
+    fig.update_traces(
+        texttemplate="%{z:.0f}%",
+        customdata=ct.values,
+        hovertemplate="%{y} / %{x}<br>%{z:.0f}% (n=%{customdata})<extra></extra>",
+    )
+    fig.update_layout(coloraxis_colorbar=dict(ticksuffix="%"))
     fig.update_xaxes(title=None, tickfont=dict(size=11))
     fig.update_yaxes(title=None, tickfont=dict(size=11))
     return styliser_titre(fig, titre)
@@ -264,6 +335,9 @@ def diviser_obstacles(cellule):
 
 
 def fig_obstacles_complet(df):
+    """Barres empilees en % : chaque obstacle est normalise a 100% des repondants qui
+    l'ont evalue, pour montrer la composition (part majeur/mineur/pas un obstacle)
+    plutot que des comptes bruts."""
     lignes = []
     for niveau, col in COL_OBSTACLES.items():
         if col not in df.columns:
@@ -276,27 +350,36 @@ def fig_obstacles_complet(df):
         return px.bar(title="Aucune donnee obstacle")
 
     df_obs = pd.DataFrame(lignes)
-    pivot = df_obs.groupby(["obstacle", "niveau"]).size().reset_index(name="nombre")
+    ordre_niveaux = [n for n in ["Pas un obstacle", "Obstacle mineur", "Obstacle majeur"] if n in df_obs["niveau"].unique()]
+    pivot = df_obs.groupby(["obstacle", "niveau"]).size().unstack(fill_value=0).reindex(columns=ordre_niveaux, fill_value=0)
 
-    majeurs = pivot[pivot["niveau"] == "Obstacle majeur"].set_index("obstacle")["nombre"]
-    ordre_obstacles = (
-        majeurs.reindex(pivot["obstacle"].unique()).fillna(0).sort_values(ascending=True).index.tolist()
-    )
+    effectifs = pivot.sum(axis=1)
+    majeurs = pivot["Obstacle majeur"] if "Obstacle majeur" in pivot.columns else pd.Series(0, index=pivot.index)
+    ordre_obstacles = majeurs.sort_values(ascending=True).index.tolist()
+    pivot = pivot.loc[ordre_obstacles]
+    effectifs = effectifs.loc[ordre_obstacles]
+    pivot_pct = pivot.div(effectifs, axis=0) * 100
+    etiquettes = [f"{o} (n={effectifs[o]})" for o in ordre_obstacles]
 
-    fig = px.bar(
-        pivot, x="nombre", y="obstacle", color="niveau", orientation="h",
-        category_orders={
-            "obstacle": ordre_obstacles,
-            "niveau": ["Pas un obstacle", "Obstacle mineur", "Obstacle majeur"],
-        },
-        color_discrete_map={
-            "Pas un obstacle": COULEUR_OK,
-            "Obstacle mineur": COULEUR_ATTENTION,
-            "Obstacle majeur": COULEUR_ALERTE,
-        },
-        template=TEMPLATE,
+    couleurs_niveau = {
+        "Pas un obstacle": COULEUR_OK,
+        "Obstacle mineur": COULEUR_ATTENTION,
+        "Obstacle majeur": COULEUR_ALERTE,
+    }
+
+    fig = go.Figure()
+    for niveau in ordre_niveaux:
+        fig.add_trace(go.Bar(
+            y=etiquettes, x=pivot_pct[niveau], name=niveau, orientation="h",
+            marker=dict(color=couleurs_niveau.get(niveau)),
+            customdata=pivot[niveau].values,
+            hovertemplate=f"%{{y}}<br>{niveau} : %{{x:.0f}}% (n=%{{customdata}})<extra></extra>",
+        ))
+    fig.update_layout(
+        barmode="stack", template=TEMPLATE,
+        legend_title_text="Niveau",
+        xaxis=dict(title="% des repondants", range=[0, 100], ticksuffix="%"),
     )
-    fig.update_layout(legend_title_text="Niveau")
     return styliser_titre(fig, "Obstacles rencontres")
 
 
@@ -350,12 +433,26 @@ def formater_ic(succes, n):
     return f"{pct:.0f}% (IC95: {bas*100:.0f}-{haut*100:.0f}%)"
 
 
+# Fond pastel + texte contraste associes a chaque couleur semantique des KPI. Le fond
+# seul (pastel de la couleur) ne suffit pas a garantir un bon contraste pour le vert et
+# l'orange une fois eclaircis : le chiffre utilise donc une teinte plus foncee de la
+# meme famille plutot que la couleur d'origine, pour rester lisible (WCAG AA).
+TEINTES_KPI = {
+    COULEUR_BARRE:     ("#eff6ff", "#1d4ed8"),
+    COULEUR_LIGNE:     ("#ecfeff", "#0e7490"),
+    COULEUR_OK:        ("#f0fdf4", "#15803d"),
+    COULEUR_ATTENTION: ("#fffbeb", "#b45309"),
+    COULEUR_ALERTE:    ("#fef2f2", "#b91c1c"),
+}
+
+
 def carte_kpi(valeur, label, couleur, ic=None):
+    fond, texte = TEINTES_KPI.get(couleur, ("#f8fafc", "#334155"))
     ic_html = f'<div style="font-size:11px; color:#9ca3af; margin-top:2px;">{ic}</div>' if ic else ""
     return f"""
-    <div style="flex:1; min-width:150px; background:white; border-radius:10px;
-                border-left:5px solid {couleur}; padding:16px 18px; box-shadow:0 1px 3px rgba(0,0,0,0.08);">
-        <div style="font-size:28px; font-weight:700; color:#111827; line-height:1.1;">{valeur}</div>
+    <div style="flex:1; min-width:150px; background:{fond}; border-radius:10px;
+                padding:16px 18px; box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+        <div style="font-size:28px; font-weight:700; color:{texte}; line-height:1.1;">{valeur}</div>
         <div style="font-size:13px; color:#6b7280; margin-top:4px;">{label}</div>
         {ic_html}
     </div>
@@ -422,9 +519,6 @@ def generer_kpis(df):
 # =============================================================
 # Insights automatiques (croisements)
 # =============================================================
-
-SEUIL_MIN_GROUPE = 5  # en dessous de ce nombre de reponses, on ne compare pas (trop peu fiable)
-
 
 def taux_rapide(df, col_groupe):
     """Retourne, pour chaque valeur de col_groupe, le (%, n) de repondants ayant trouve un emploi en 6 mois ou moins."""
@@ -827,23 +921,47 @@ A retenir avec un echantillon de cette taille : l'absence de resultat "significa
 # Carte de mots-cles
 # =============================================================
 
+FREQ_MIN_NUAGE = 2  # frequence minimale pour apparaitre dans le nuage visuel (reduit le bruit des mentions isolees)
+TOP_MOTS_LISTE = 15  # nombre de mots affiches dans la liste de repli
+
+
+def liste_mots_frequents(frequences, top_n=TOP_MOTS_LISTE):
+    """Liste HTML des mots les plus frequents, utilisee en repli quand l'echantillon est
+    trop petit pour un nuage de mots representatif (tous les mots sont gardes, y compris
+    les mentions uniques, pour rester transparent sur un tres petit echantillon)."""
+    top = frequences.most_common(top_n)
+    items = "".join(f"<li>{mot} <span style='color:#9ca3af;'>({n})</span></li>" for mot, n in top)
+    return f"<ul style='columns:2; font-size:14px; line-height:1.8; padding-left:20px;'>{items}</ul>"
+
+
 def generer_carte_mots_cles(df):
+    """Retourne (image_nuage, html_liste_repli) : un seul des deux est renseigne.
+    Sous SEUIL_MIN_GROUPE reponses textuelles, le nuage visuel n'est pas assez
+    representatif -> on bascule sur une liste brute des mots les plus frequents."""
     if COL_CONSEIL not in df.columns:
-        return None
+        return None, None
     textes = df[COL_CONSEIL].dropna().astype(str).tolist()
     if not textes:
-        return None
+        return None, None
     texte_complet = " ".join(textes).lower()
     mots = re.findall(r"[a-zàâäéèêëïîôöùûüç]+", texte_complet)
     mots_filtres = [m for m in mots if enlever_accents(m) not in STOPWORDS_FR_SANS_ACCENTS and len(m) > 2]
     if not mots_filtres:
-        return None
+        return None, None
     frequences = Counter(mots_filtres)
+
+    if len(textes) < SEUIL_MIN_GROUPE:
+        return None, liste_mots_frequents(frequences)
+
+    frequences_nuage = Counter({m: n for m, n in frequences.items() if n >= FREQ_MIN_NUAGE})
+    if not frequences_nuage:
+        return None, liste_mots_frequents(frequences)
+
     wc = WordCloud(
         width=900, height=450, background_color="white",
         colormap="viridis", prefer_horizontal=0.9,
-    ).generate_from_frequencies(frequences)
-    return wc.to_array()
+    ).generate_from_frequencies(frequences_nuage)
+    return wc.to_array(), None
 
 
 # =============================================================
@@ -851,25 +969,37 @@ def generer_carte_mots_cles(df):
 # =============================================================
 
 def fig_heatmap_generique(df, col_lignes, col_colonnes, titre, ordre_colonnes=None):
-    """Carte de chaleur generique entre deux variables categorielles quelconques."""
+    """Carte de chaleur generique en % par ligne entre deux variables categorielles
+    quelconques. Les categories de ligne peu representees sont fusionnees dans 'Autres'
+    pour rester comparables malgre des tailles de groupe tres differentes."""
     if col_lignes not in df.columns or col_colonnes not in df.columns:
         return styliser_titre(px.imshow([[0]], template=TEMPLATE), f"Donnees indisponibles: {titre}")
-    sub = df[[col_lignes, col_colonnes]].dropna()
+    sub = df[[col_lignes, col_colonnes]].dropna().copy()
     if sub.empty:
         return styliser_titre(px.imshow([[0]], template=TEMPLATE), f"Pas encore de donnees: {titre}")
+
+    sub[col_lignes] = fusionner_petits_groupes(sub[col_lignes])
 
     ct = pd.crosstab(sub[col_lignes], sub[col_colonnes])
     if ordre_colonnes:
         colonnes_presentes = [c for c in ordre_colonnes if c in ct.columns]
         ct = ct[colonnes_presentes]
-    ct = ct.loc[ct.sum(axis=1).sort_values(ascending=False).index]
+    effectifs = ct.sum(axis=1).sort_values(ascending=False)
+    ct = ct.loc[effectifs.index]
+    ct_pct = ct.div(effectifs, axis=0) * 100
+    etiquettes_lignes = [f"{idx} (n={effectifs[idx]})" for idx in ct.index]
 
     fig = px.imshow(
-        ct.values, x=ct.columns, y=ct.index,
-        color_continuous_scale=GRADIENT_HEATMAP,
-        text_auto=True, aspect="auto", template=TEMPLATE,
+        ct_pct.values, x=ct_pct.columns, y=etiquettes_lignes,
+        color_continuous_scale=GRADIENT_HEATMAP, zmin=0, zmax=100,
+        aspect="auto", template=TEMPLATE,
     )
-    fig.update_layout(coloraxis_showscale=False)
+    fig.update_traces(
+        texttemplate="%{z:.0f}%",
+        customdata=ct.values,
+        hovertemplate="%{y} / %{x}<br>%{z:.0f}% (n=%{customdata})<extra></extra>",
+    )
+    fig.update_layout(coloraxis_colorbar=dict(ticksuffix="%"))
     fig.update_xaxes(title=None, tickfont=dict(size=11))
     fig.update_yaxes(title=None, tickfont=dict(size=10))
     return styliser_titre(fig, titre)
@@ -900,57 +1030,145 @@ def construire_dashboard(regions=None, ages=None, genre="Tous", annees=None, dom
         df, COL_STATUT_TRAVAIL, COL_FORMATION_CA,
         "Statut d'emploi par formation canadienne",
     )
-    img_wordcloud = generer_carte_mots_cles(df)
+    img_wordcloud, html_repli_mots = generer_carte_mots_cles(df)
+    img_wordcloud = gr.update(value=img_wordcloud, visible=img_wordcloud is not None)
+    html_repli_mots = gr.update(value=html_repli_mots, visible=html_repli_mots is not None)
 
-    return kpis, insights, g1, g2, g3, g4, g5, g6, g7, g8, img_wordcloud
+    return kpis, insights, g1, g2, g3, g4, g5, g6, g7, g8, img_wordcloud, html_repli_mots
 
 
 # =============================================================
 # Interface Gradio
 # =============================================================
 
+# Rampe de vert franco-ontarien (profond/foret, pas vif) utilisee comme teinte secondaire
+# du theme -- colore entre autres les boutons "secondary" (ex: Rafraichir les donnees).
+VERT_FRANCO_HUE = gr.themes.Color(
+    c50="#f1f8f4", c100="#dcefe3", c200="#b9dfc8", c300="#8cc7a3",
+    c400="#5aa87c", c500="#357f5c", c600="#26634a", c700=COULEUR_VERT_FRANCO,
+    c800="#1a4033", c900="#16342a", c950="#0b1d17",
+)
+THEME = gr.themes.Soft(primary_hue="blue", secondary_hue=VERT_FRANCO_HUE, neutral_hue="slate")
+
+# CSS personnalise : coins/ombres plus marques, espacement plus genereux entre sections
+# (via elem_classes plutot que des classes internes Gradio, plus stable), et une police
+# a empattements pour les titres (H1-H3) qui tranche avec Montserrat en corps de texte.
+CSS_PERSONNALISE = """
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&display=swap');
+
+.gradio-container {
+    --block-radius: 14px;
+    --block-shadow: 0 4px 18px rgba(15, 23, 42, 0.07);
+    --block-border-width: 1px;
+    --block-border-color: rgba(15, 23, 42, 0.06);
+    max-width: 1400px !important;
+}
+
+.gradio-container h1,
+.gradio-container h2,
+.gradio-container h3 {
+    font-family: 'Fraunces', Georgia, serif;
+    letter-spacing: -0.01em;
+}
+
+.section-row {
+    margin-bottom: 28px !important;
+}
+
+.section-heading {
+    margin-top: 22px !important;
+    margin-bottom: 12px !important;
+}
+
+/* Etiquettes des filtres : texte gras neutre, sans fond/bordure de badge, pour que le
+   menu deroulant (l'element actionnable) reste visuellement plus proeminent que son
+   etiquette (norme de design Gestalt du projet, voir CLAUDE.md).
+   NB : le libelle d'un Dropdown est rendu via un <span> qui lit --block-title-*
+   (pas --block-label-*, qui ne s'applique qu'aux badges type "Plot"/"Graphique"
+   portes par un <label>) -- verifie par inspection du CSS compile de Gradio. */
+.filtre-label {
+    --block-title-background-fill: transparent;
+    --block-title-border-width: 0px;
+    --block-title-text-color: #334155;
+    --block-title-text-weight: 700;
+    --block-title-padding: 0 0 6px 0;
+    --block-title-radius: 0px;
+}
+"""
+
+# Petit trille stylise (fleur emblematique de l'Ontario) en trait geometrique tres discret,
+# utilise uniquement comme touche d'identite a cote du titre principal.
+TRILLE_SVG = f"""<svg width="24" height="24" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <g fill="{COULEUR_VERT_FRANCO}" fill-opacity="0.85">
+    <ellipse cx="50" cy="28" rx="13" ry="23" transform="rotate(0 50 50)"/>
+    <ellipse cx="50" cy="28" rx="13" ry="23" transform="rotate(120 50 50)"/>
+    <ellipse cx="50" cy="28" rx="13" ry="23" transform="rotate(240 50 50)"/>
+  </g>
+  <circle cx="50" cy="50" r="6" fill="#fafaf9"/>
+</svg>"""
+
 with gr.Blocks(title="Dashboard - Sondage immigration francophone Ontario") as demo:
-    gr.Markdown("# Immigration francophone en Ontario")
+    gr.HTML(f"""
+    <div style="display:flex; align-items:center; gap:10px;">
+        {TRILLE_SVG}
+        <h1 style="font-size:26px; font-weight:700; color:#111827; margin:0;">Immigration francophone en Ontario</h1>
+    </div>
+    <div style="height:3px; width:64px; background:{COULEUR_VERT_FRANCO}; border-radius:2px; margin:8px 0 4px;"></div>
+    """)
 
     with gr.Row():
         with gr.Column(scale=1, min_width=220):
             gr.Markdown("### Filtres")
-            filtre_region = gr.Dropdown(choices=CHOIX_REGION, multiselect=True, label="Region d'origine", value=[])
-            filtre_age = gr.Dropdown(choices=CHOIX_AGE, multiselect=True, label="Tranche d'age", value=[])
-            filtre_genre = gr.Dropdown(choices=["Tous", "Femme", "Homme"], value="Tous", label="Genre")
-            filtre_annees = gr.Dropdown(choices=CHOIX_ANNEES, multiselect=True, label="Annees au Canada", value=[])
+            filtre_region = gr.Dropdown(
+                choices=CHOIX_REGION, multiselect=True, label="Region d'origine", value=[],
+                elem_classes=["filtre-label"],
+            )
+            filtre_age = gr.Dropdown(
+                choices=CHOIX_AGE, multiselect=True, label="Tranche d'age", value=[],
+                elem_classes=["filtre-label"],
+            )
+            filtre_genre = gr.Dropdown(
+                choices=["Tous", "Femme", "Homme"], value="Tous", label="Genre",
+                elem_classes=["filtre-label"],
+            )
+            filtre_annees = gr.Dropdown(
+                choices=CHOIX_ANNEES, multiselect=True, label="Annees au Canada", value=[],
+                elem_classes=["filtre-label"],
+            )
             filtre_domaine = gr.Dropdown(
                 choices=["Tous", "Dans le domaine", "Hors domaine"], value="Tous",
                 label="Emploi dans le domaine ?",
+                elem_classes=["filtre-label"],
             )
             bouton_refresh = gr.Button("Rafraichir les donnees")
 
         with gr.Column(scale=4):
             with gr.Tabs():
                 with gr.Tab("Vue d'ensemble"):
-                    kpi_html = gr.HTML()
+                    kpi_html = gr.HTML(elem_classes=["section-row"])
 
-                    gr.Markdown("## Insights cles")
+                    gr.Markdown("## Insights cles", elem_classes=["section-heading"])
                     insights_txt = gr.Markdown()
 
-                    with gr.Row():
+                    with gr.Row(elem_classes=["section-row"]):
                         g1 = gr.Plot()
-                        g2 = gr.Plot()
-                    with gr.Row():
                         g7 = gr.Plot()
+                    with gr.Row(elem_classes=["section-row"]):
+                        g2 = gr.Plot()
 
-                    gr.Markdown("## Carte des mots-cles - conseils aux futurs arrivants")
+                    gr.Markdown("## Carte des mots-cles - conseils aux futurs arrivants", elem_classes=["section-heading"])
                     img_nuage = gr.Image(label="Mots les plus frequents", show_label=False)
+                    liste_mots_html = gr.HTML()
 
                 with gr.Tab("Croisements"):
-                    gr.Markdown("## Croisements avec le delai d'obtention d'un emploi, et avec la correspondance au domaine")
-                    with gr.Row():
+                    gr.Markdown("## Croisements avec le delai d'obtention d'un emploi, et avec la correspondance au domaine", elem_classes=["section-heading"])
+                    with gr.Row(elem_classes=["section-row"]):
                         g3 = gr.Plot()
                         g4 = gr.Plot()
-                    with gr.Row():
+                    with gr.Row(elem_classes=["section-row"]):
                         g5 = gr.Plot()
                         g6 = gr.Plot()
-                    with gr.Row():
+                    with gr.Row(elem_classes=["section-row"]):
                         g8 = gr.Plot()
 
                 with gr.Tab("Tests statistiques"):
@@ -961,7 +1179,7 @@ with gr.Blocks(title="Dashboard - Sondage immigration francophone Ontario") as d
                     bouton_stats.click(construire_page_stats, outputs=stats_md)
 
     entrees = [filtre_region, filtre_age, filtre_genre, filtre_annees, filtre_domaine]
-    sorties = [kpi_html, insights_txt, g1, g2, g3, g4, g5, g6, g7, g8, img_nuage]
+    sorties = [kpi_html, insights_txt, g1, g2, g3, g4, g5, g6, g7, g8, img_nuage, liste_mots_html]
 
     demo.load(construire_dashboard, inputs=entrees, outputs=sorties)
     bouton_refresh.click(construire_dashboard, inputs=entrees, outputs=sorties)
@@ -972,4 +1190,4 @@ with gr.Blocks(title="Dashboard - Sondage immigration francophone Ontario") as d
     filtre_domaine.change(construire_dashboard, inputs=entrees, outputs=sorties)
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(theme=THEME, css=CSS_PERSONNALISE)
